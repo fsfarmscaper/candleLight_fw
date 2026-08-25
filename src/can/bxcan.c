@@ -24,7 +24,6 @@
  *
  */
 
-#include "board.h"
 #include "can.h"
 #include "can_common.h"
 #include "can_drv.h"
@@ -32,15 +31,6 @@
 #include "device.h"
 #include "gs_usb.h"
 #include "timer.h"
-
-#define BXCAN_LEC_NO_ERROR	  0
-#define BXCAN_LEC_STUFF_ERROR 1
-#define BXCAN_LEC_FORM_ERROR  2
-#define BXCAN_LEC_ACK_ERROR	  3
-#define BXCAN_LEC_REC_ERROR	  4
-#define BXCAN_LEC_DOM_ERROR	  5
-#define BXCAN_LEC_CRC_ERROR	  6
-#define BXCAN_LEC_SOFTWARE	  7
 
 const struct gs_device_bt_const CAN_btconst = {
 	.feature =
@@ -56,6 +46,7 @@ const struct gs_device_bt_const CAN_btconst = {
 		GS_CAN_FEATURE_GET_STATE |
 		(IS_ENABLED(CONFIG_CAN_FILTER) ?
 		 GS_CAN_FEATURE_FILTER : 0) |
+		GS_CAN_FEATURE_BUS_OFF_RECOVERY |
 		0,
 	.fclk_can = CAN_CLOCK_SPEED,
 	.btc = {
@@ -112,14 +103,6 @@ void can_init(can_data_t *channel, const struct board_channel_config *channel_co
 	filter->fa1r = 0x1;     // Enable filter bank 0
 }
 
-void can_set_bittiming(can_data_t *channel, const struct gs_device_bittiming *timing)
-{
-	channel->btr = FIELD_PREP(CAN_BTR_SJW, timing->sjw - 1) |
-				   FIELD_PREP(CAN_BTR_TS2, timing->phase_seg2 - 1) |
-				   FIELD_PREP(CAN_BTR_TS1, timing->prop_seg + timing->phase_seg1 - 1) |
-				   FIELD_PREP(CAN_BTR_BRP, timing->brp - 1);
-}
-
 #ifdef CONFIG_CAN_FILTER
 void can_set_filter(can_data_t *channel, const struct gs_device_filter *filter)
 {
@@ -163,13 +146,16 @@ void can_drv_enable(struct can_channel *channel)
 	const uint32_t feature = channel->feature;
 	CAN_TypeDef *can = channel->instance;
 
-	uint32_t mcr = CAN_MCR_INRQ | CAN_MCR_ABOM | CAN_MCR_TXFP;
+	uint32_t mcr = CAN_MCR_INRQ | CAN_MCR_TXFP;
 
 	if (feature & GS_CAN_FEATURE_ONE_SHOT) {
 		mcr |= CAN_MCR_NART;
 	}
 
-	uint32_t btr = channel->btr;
+	uint32_t btr = FIELD_PREP(CAN_BTR_SJW, channel->bittiming.sjw - 1) |
+				   FIELD_PREP(CAN_BTR_TS2, channel->bittiming.phase_seg2 - 1) |
+				   FIELD_PREP(CAN_BTR_TS1, channel->bittiming.prop_seg + channel->bittiming.phase_seg1 - 1) |
+				   FIELD_PREP(CAN_BTR_BRP, channel->bittiming.brp - 1);
 
 	if (feature & GS_CAN_FEATURE_LISTEN_ONLY) {
 		btr |= CAN_MODE_SILENT;
@@ -197,23 +183,13 @@ void can_drv_enable(struct can_channel *channel)
 
 	can->MCR &= ~CAN_MCR_INRQ;
 	while ((can->MSR & CAN_MSR_INAK) != 0);
-
-	board_phy_power_set(channel, true);
 }
 
 void can_drv_disable(struct can_channel *channel)
 {
 	CAN_TypeDef *can = channel->instance;
 
-	board_phy_power_set(channel, false);
 	can->MCR |= CAN_MCR_INRQ;     // send can controller into initialization mode
-}
-
-bool can_is_enabled(can_data_t *channel)
-{
-	CAN_TypeDef *can = channel->instance;
-
-	return (can->MCR & CAN_MCR_INRQ) == 0;
 }
 
 bool can_is_rx_pending(can_data_t *channel)
@@ -321,12 +297,48 @@ bool can_send(can_data_t *channel, struct gs_host_frame *frame)
 	}
 }
 
+bool can_drv_bus_error_pending(const struct can_channel *channel)
+{
+	const uint32_t reg_esr = channel->reg_status.esr;
+	const uint8_t lec = FIELD_GET(CAN_ESR_LEC, reg_esr);
+
+	return can_is_lec_error(lec);
+}
+
+void can_drv_read_reg_status(struct can_channel *channel)
+{
+	channel->reg_status.esr = channel->instance->ESR;
+
+	if (can_drv_bus_error_pending(channel)) {
+		/* mark as handled by software */
+		channel->instance->ESR |= FIELD_PREP(CAN_ESR_LEC, CAN_LEC_SOFTWARE);
+	}
+}
+
+bool can_drv_handle_bus_error(const struct can_channel *channel, struct gs_host_frame *frame)
+{
+	const uint32_t reg_esr = channel->reg_status.esr;
+
+	const uint8_t tx_err = FIELD_GET(CAN_ESR_TEC, reg_esr);
+	const uint8_t rx_err = FIELD_GET(CAN_ESR_REC, reg_esr);
+
+	if (tx_err == 0 && rx_err == 0) {
+		return false;
+	}
+
+	frame->classic_can->data[6] = tx_err;
+	frame->classic_can->data[7] = rx_err;
+
+	frame->can_id |= CAN_ERR_PROT | CAN_ERR_BUSERROR | CAN_ERR_CNT;
+
+	can_lec_error_to_frame(frame, FIELD_GET(CAN_ESR_LEC, reg_esr));
+
+	return true;
+}
+
 enum gs_can_state can_drv_get_state(const struct can_channel *channel)
 {
-	if (channel->state >= GS_CAN_STATE_STOPPED)
-		return channel->state;
-
-	const uint32_t reg_esr = channel->instance->ESR;
+	const uint32_t reg_esr = channel->reg_status.esr;
 
 	if (!(reg_esr & (CAN_ESR_BOFF | CAN_ESR_EPVF | CAN_ESR_EWGF))) {
 		return GS_CAN_STATE_ERROR_ACTIVE;
@@ -343,80 +355,36 @@ enum gs_can_state can_drv_get_state(const struct can_channel *channel)
 	return GS_CAN_STATE_ERROR_WARNING;
 }
 
-void can_drv_handle_state_change(const struct can_channel *channel, struct gs_host_frame *frame)
-{
-	const uint32_t reg_esr = channel->instance->ESR;
-	enum gs_can_state tx_state, rx_state;
-	u8 tx_err, rx_err;
-
-	tx_err = FIELD_GET(CAN_ESR_TEC, reg_esr);
-	rx_err = FIELD_GET(CAN_ESR_REC, reg_esr);
-
-	tx_state = can_err_to_state(tx_err);
-	rx_state = can_err_to_state(rx_err);
-
-	if (tx_state >= rx_state)
-		frame->classic_can->data[1] |= gs_can_tx_state_to_frame(tx_state);
-	if (tx_state <= rx_state)
-		frame->classic_can->data[1] |= gs_can_rx_state_to_frame(rx_state);
-
-	frame->classic_can->data[6] = tx_err;
-	frame->classic_can->data[7] = rx_err;
-}
-
 void can_drv_get_device_state(const struct can_channel *channel, struct gs_device_state *state)
 {
-	const uint32_t reg_esr = channel->instance->ESR;
+	const uint32_t reg_esr = channel->reg_status.esr;
 
 	state->state = can_drv_get_state(channel);
 	state->rxerr = FIELD_GET(CAN_ESR_REC, reg_esr);
 	state->txerr = FIELD_GET(CAN_ESR_TEC, reg_esr);
 }
 
-bool can_drv_bus_error_pending(const struct can_channel *channel)
+void can_drv_handle_state_change(const struct can_channel *channel, struct gs_host_frame *frame)
 {
-	if (!(channel->feature & GS_CAN_FEATURE_BERR_REPORTING)) {
-		return false;
+	const uint32_t reg_esr = channel->reg_status.esr;
+
+	const uint8_t tx_err = FIELD_GET(CAN_ESR_TEC, reg_esr);
+	const uint8_t rx_err = FIELD_GET(CAN_ESR_REC, reg_esr);
+
+	const enum gs_can_state tx_state = can_err_to_state(tx_err);
+	const enum gs_can_state rx_state = can_err_to_state(rx_err);
+
+	if (tx_state >= rx_state) {
+		frame->classic_can->data[1] |= gs_can_tx_state_to_frame(tx_state);
 	}
 
-	const uint32_t reg_esr = channel->instance->ESR;
-	const uint32_t lec = FIELD_GET(CAN_ESR_LEC, reg_esr);
-
-	return lec != BXCAN_LEC_NO_ERROR && lec != BXCAN_LEC_SOFTWARE;
+	if (tx_state <= rx_state) {
+		frame->classic_can->data[1] |= gs_can_rx_state_to_frame(rx_state);
+	}
 }
 
-void can_drv_handle_bus_error(const struct can_channel *channel, struct gs_host_frame *frame)
+void can_drv_handle_bus_off_recovery(struct can_channel *channel)
 {
-	const uint32_t reg_esr = channel->instance->ESR;
-	const uint32_t lec = FIELD_GET(CAN_ESR_LEC, reg_esr);
-
-	frame->can_id |= CAN_ERR_PROT | CAN_ERR_BUSERROR | CAN_ERR_CNT;
-	frame->classic_can->data[6] = FIELD_GET(CAN_ESR_TEC, reg_esr);
-	frame->classic_can->data[7] = FIELD_GET(CAN_ESR_REC, reg_esr);
-
-	switch (lec) {
-		case BXCAN_LEC_STUFF_ERROR:
-			frame->classic_can->data[2] |= CAN_ERR_PROT_STUFF;
-			break;
-		case BXCAN_LEC_FORM_ERROR:
-			frame->classic_can->data[2] |= CAN_ERR_PROT_FORM;
-			break;
-		case BXCAN_LEC_ACK_ERROR:
-			frame->can_id |= CAN_ERR_ACK;
-			break;
-		case BXCAN_LEC_REC_ERROR:
-			frame->classic_can->data[2] |= CAN_ERR_PROT_BIT1;
-			break;
-		case BXCAN_LEC_DOM_ERROR:
-			frame->classic_can->data[2] |= CAN_ERR_PROT_BIT0;
-			break;
-		case BXCAN_LEC_CRC_ERROR:
-			frame->classic_can->data[3] |= CAN_ERR_PROT_LOC_CRC_SEQ;
-			break;
-		default:
-			break;
-	}
-
-	/* mark as handled by software */
-	channel->instance->ESR |= FIELD_PREP(CAN_ESR_LEC, BXCAN_LEC_SOFTWARE);
+	can_drv_disable(channel);
+	can_drv_enable(channel);
 }

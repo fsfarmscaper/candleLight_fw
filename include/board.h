@@ -36,6 +36,8 @@
 struct board_channel_config {
 #if defined(CONFIG_BXCAN)
 	CAN_TypeDef *interface;
+#elif defined(CONFIG_M_CAN)
+	FDCAN_GlobalTypeDef *interface;
 #endif
 };
 
@@ -60,10 +62,9 @@ static inline void board_phy_power_set(can_data_t *channel, bool enable)
 }
 #else
 #define SET_PHY_POWER_FN(set_fn)
-static inline void board_phy_power_set(can_data_t *channel, bool enable)
+static inline void board_phy_power_set(can_data_t __maybe_unused *channel,
+									   bool __maybe_unused enable)
 {
-	UNUSED(channel);
-	UNUSED(enable);
 }
 #endif
 
@@ -76,9 +77,8 @@ static inline void board_termination_set(can_data_t *channel, enum gs_can_termin
 }
 #else
 #define SET_TERMINATION_FN(set_fn)
-static inline void board_termination_set(can_data_t *channel, enum gs_can_termination_state state)
+static inline void board_termination_set(can_data_t __maybe_unused *channel,
+										 enum gs_can_termination_state __maybe_unused state)
 {
-	UNUSED(channel);
-	UNUSED(state);
 }
 #endif
